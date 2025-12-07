@@ -1,4 +1,4 @@
-# Yamaha Discord Remote
+# Yamaha Discord RPC
 
 A lightweight Discord-based remote control for Yamaha receivers using
 the Yamaha Extended Control API (YXC).
