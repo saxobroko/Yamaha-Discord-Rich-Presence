@@ -25,12 +25,21 @@ import pystray
 from PIL import Image
 import sys
 
-CONFIG_FILE = "yamaha_rpc_config.json"
-CACHE_FILE = "cache.json"
 GENERIC_IMAGE = "3844724"
 SUBSONIC_API_VERSION = "1.16.1"
 SUBSONIC_CLIENT = "YamahaRPC"
 SOURCE_MODES = ("auto", "yamaha", "navidrome")
+
+
+def app_dir():
+    """Writable directory next to the exe when frozen; otherwise cwd."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(".")
+
+
+CONFIG_FILE = os.path.join(app_dir(), "yamaha_rpc_config.json")
+CACHE_FILE = os.path.join(app_dir(), "cache.json")
 
 # ---------------- Cache ----------------
 class Cache:
@@ -460,15 +469,22 @@ class App(tk.Tk):
         return os.path.join(base_path, relative_path)
 
     def create_tray_icon(self):
-        icon_image = Image.open(self.resource_path("3844724.png"))
-        self.tray_icon = pystray.Icon("YamahaRPC")
-        self.tray_icon.icon = icon_image
-        self.tray_icon.title = "Yamaha Discord RPC"
-        self.tray_icon.menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
-        # double-click restores GUI
-        self.tray_icon.run_detached()
-        self.tray_icon.visible = True
-        self.tray_icon._on_double_click = lambda icon, item: self.restore_from_tray()
+        try:
+            icon_path = self.resource_path("3844724.png")
+            if os.path.exists(icon_path):
+                icon_image = Image.open(icon_path)
+            else:
+                icon_image = Image.new("RGB", (64, 64), color=(32, 40, 52))
+            self.tray_icon = pystray.Icon("YamahaRPC")
+            self.tray_icon.icon = icon_image
+            self.tray_icon.title = "Yamaha Discord RPC"
+            self.tray_icon.menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
+            # double-click restores GUI
+            self.tray_icon.run_detached()
+            self.tray_icon.visible = True
+            self.tray_icon._on_double_click = lambda icon, item: self.restore_from_tray()
+        except Exception:
+            self.tray_icon = None
 
     def hide_to_tray(self):
         self.withdraw()

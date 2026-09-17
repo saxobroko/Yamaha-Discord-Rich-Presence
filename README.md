@@ -53,11 +53,19 @@ You can find this on your receiver:
 
 Install dependencies:
 
-    pip install requests python-dotenv
+    pip install -r requirements.txt
 
 Run:
 
     python yamaha_rpc_gui.py
+
+### 6. Windows exe (optional)
+
+A one-file Windows build is produced by GitHub Actions (`Build Windows exe`) or locally on Windows:
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+
+Output: `dist/YamahaDiscordRPC.exe` (unsigned — SmartScreen may warn on first run).
 
 ------------------------------------------------------------------------
 
