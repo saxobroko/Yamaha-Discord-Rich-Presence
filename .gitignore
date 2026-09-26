@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+dist/
+build/
+*.spec.bak
+yamaha_rpc_config.json
+cache.json
+.venv/
+venv/
