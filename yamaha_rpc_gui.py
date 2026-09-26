@@ -490,8 +490,10 @@ class App(tk.Tk):
         # Size to content; keep resizable with a sensible minimum
         self._fit_to_content()
 
-        # Tray icon setup
+        # Tray icon setup — minimize and close both hide to tray
         self.tray_icon = None
+        self._tray_hiding = False
+        self.bind("<Unmap>", self._on_unmap)
 
     # ---------------- Helper Methods ----------------
     def _apply_dpi_scaling(self):
@@ -523,6 +525,25 @@ class App(tk.Tk):
             base_path = os.path.abspath(".")
         return os.path.join(base_path, relative_path)
 
+    def _on_unmap(self, event):
+        """Minimize button → tray (not a taskbar-iconified window)."""
+        if event.widget is not self or self._tray_hiding:
+            return
+        try:
+            if self.state() != "iconic":
+                return
+        except tk.TclError:
+            return
+        # Defer so Windows finishes the iconify before we withdraw (less flicker)
+        self._tray_hiding = True
+        self.after(0, self._minimize_to_tray)
+
+    def _minimize_to_tray(self):
+        try:
+            self.hide_to_tray()
+        finally:
+            self._tray_hiding = False
+
     def create_tray_icon(self):
         try:
             icon_path = self.resource_path("3844724.png")
@@ -530,34 +551,68 @@ class App(tk.Tk):
                 icon_image = Image.open(icon_path)
             else:
                 icon_image = Image.new("RGB", (64, 64), color=(32, 40, 52))
-            self.tray_icon = pystray.Icon("YamahaRPC")
-            self.tray_icon.icon = icon_image
-            self.tray_icon.title = "Yamaha Discord RPC"
-            self.tray_icon.menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
-            # double-click restores GUI
+            self.tray_icon = pystray.Icon(
+                "YamahaRPC",
+                icon_image,
+                "Yamaha Discord RPC",
+                menu=pystray.Menu(
+                    pystray.MenuItem(
+                        "Show",
+                        self._tray_show,
+                        default=True,
+                    ),
+                    pystray.MenuItem("Quit", self._tray_quit),
+                ),
+            )
             self.tray_icon.run_detached()
             self.tray_icon.visible = True
-            self.tray_icon._on_double_click = lambda icon, item: self.restore_from_tray()
         except Exception:
             self.tray_icon = None
 
+    def _tray_show(self, icon=None, item=None):
+        # pystray callbacks run off the Tk thread
+        self.after(0, self.restore_from_tray)
+
+    def _tray_quit(self, icon=None, item=None):
+        self.after(0, self.quit_app)
+
     def hide_to_tray(self):
-        self.withdraw()
+        try:
+            # withdraw removes taskbar button; preferred over staying iconic
+            self.withdraw()
+        except tk.TclError:
+            pass
         if not self.tray_icon:
             self.create_tray_icon()
+        elif self.tray_icon:
+            try:
+                self.tray_icon.visible = True
+            except Exception:
+                pass
 
     def restore_from_tray(self):
-        self.deiconify()
-        self.lift()
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
         if self.tray_icon:
-            self.tray_icon.visible = False
+            try:
+                self.tray_icon.visible = False
+            except Exception:
+                pass
 
     def quit_app(self, icon=None):
         if hasattr(self, "bridge") and self.bridge.running():
             self.bridge.stop()
             time.sleep(0.2)
         if self.tray_icon:
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.destroy()
 
     def save_config(self):
