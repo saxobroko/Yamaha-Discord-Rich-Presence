@@ -377,7 +377,9 @@ class App(tk.Tk):
         super().__init__()
         self.title("Yamaha / Navidrome → Discord RPC")
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
-        self._apply_dpi_scaling()
+        self._last_dpi = None
+        self._dpi_check_after = None
+        self._apply_dpi_scaling(force=True)
 
         self.config_data = self.load_config()
         frm = ttk.Frame(self, padding=12)
@@ -488,25 +490,79 @@ class App(tk.Tk):
         self.status_lbl.grid(row=row, column=1, sticky="w")
 
         # Size to content; keep resizable with a sensible minimum
+        self._apply_dpi_scaling(force=True)
         self._fit_to_content()
 
         # Tray icon setup — minimize and close both hide to tray
         self.tray_icon = None
         self._tray_hiding = False
         self.bind("<Unmap>", self._on_unmap)
+        # Re-scale when the window moves to a monitor with a different DPI
+        self.bind("<Configure>", self._on_configure)
 
     # ---------------- Helper Methods ----------------
-    def _apply_dpi_scaling(self):
-        """Align Tk's scaling with the display DPI (helps crisp text on HiDPI)."""
+    def _get_window_dpi(self):
+        """Current monitor DPI for this window (Windows GetDpiForWindow when available)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.winfo_id())
+                # Prefer top-level HWND — Tk's winfo_id may be a child frame
+                GA_ROOT = 2
+                root = ctypes.windll.user32.GetAncestor(hwnd, GA_ROOT)
+                if root:
+                    hwnd = root
+                dpi = int(ctypes.windll.user32.GetDpiForWindow(hwnd))
+                if dpi > 0:
+                    return float(dpi)
+            except Exception:
+                pass
         try:
-            # Pixels per inch reported by Tk after DPI awareness is set
             dpi = float(self.winfo_fpixels("1i"))
             if dpi > 0:
-                self.tk.call("tk", "scaling", dpi / 72.0)
+                return dpi
         except Exception:
             pass
+        return 96.0
 
-    def _fit_to_content(self):
+    def _apply_dpi_scaling(self, force=False):
+        """Align Tk scaling with the display DPI for this window.
+
+        Returns True if scaling changed.
+        """
+        try:
+            dpi = self._get_window_dpi()
+            if not force and self._last_dpi is not None and abs(dpi - self._last_dpi) < 0.5:
+                return False
+            self._last_dpi = dpi
+            self.tk.call("tk", "scaling", dpi / 72.0)
+            return True
+        except Exception:
+            return False
+
+    def _on_configure(self, event):
+        if event.widget is not self:
+            return
+        # Debounce rapid Configure events while dragging between monitors
+        if self._dpi_check_after is not None:
+            try:
+                self.after_cancel(self._dpi_check_after)
+            except Exception:
+                pass
+        self._dpi_check_after = self.after(120, self._maybe_update_monitor_dpi)
+
+    def _maybe_update_monitor_dpi(self):
+        self._dpi_check_after = None
+        try:
+            if self.state() != "normal":
+                return
+        except tk.TclError:
+            return
+        if self._apply_dpi_scaling():
+            # Refit minsize/content so 1440p→1080p (and reverse) stays proportional
+            self._fit_to_content(resize=True)
+
+    def _fit_to_content(self, resize=True):
         """Default geometry = required content size; window stays resizable."""
         self.update_idletasks()
         width = max(self.winfo_reqwidth(), 1)
@@ -515,7 +571,14 @@ class App(tk.Tk):
         width += 8
         height += 8
         self.minsize(width, height)
-        self.geometry(f"{width}x{height}")
+        if resize:
+            # Keep current top-left when only size changes after a DPI switch
+            try:
+                x = self.winfo_x()
+                y = self.winfo_y()
+                self.geometry(f"{width}x{height}+{x}+{y}")
+            except tk.TclError:
+                self.geometry(f"{width}x{height}")
         self.resizable(True, True)
 
     def resource_path(self, relative_path):
@@ -597,6 +660,8 @@ class App(tk.Tk):
             self.focus_force()
         except tk.TclError:
             pass
+        # Monitor may have changed while in tray — refresh DPI
+        self.after(50, self._maybe_update_monitor_dpi)
         if self.tray_icon:
             try:
                 self.tray_icon.visible = False
