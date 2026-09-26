@@ -41,6 +41,36 @@ def app_dir():
 CONFIG_FILE = os.path.join(app_dir(), "yamaha_rpc_config.json")
 CACHE_FILE = os.path.join(app_dir(), "cache.json")
 
+
+def enable_windows_dpi_awareness():
+    """Tell Windows this process is DPI-aware so Tk is not bitmap-upscaled (blurry).
+
+    Must run before the first Tk() / tk.Tk() is created.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # Per-monitor DPI awareness V2 (Windows 10 1703+)
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        # PROCESS_PER_MONITOR_DPI_AWARE == 2
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
 # ---------------- Cache ----------------
 class Cache:
     def __init__(self, filename=CACHE_FILE):
@@ -346,8 +376,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Yamaha / Navidrome → Discord RPC")
-        self.geometry("560x520")
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self._apply_dpi_scaling()
 
         self.config_data = self.load_config()
         frm = ttk.Frame(self, padding=12)
@@ -457,10 +487,35 @@ class App(tk.Tk):
         self.status_lbl = ttk.Label(frm, textvariable=self.status_var)
         self.status_lbl.grid(row=row, column=1, sticky="w")
 
+        # Size to content; keep resizable with a sensible minimum
+        self._fit_to_content()
+
         # Tray icon setup
         self.tray_icon = None
 
     # ---------------- Helper Methods ----------------
+    def _apply_dpi_scaling(self):
+        """Align Tk's scaling with the display DPI (helps crisp text on HiDPI)."""
+        try:
+            # Pixels per inch reported by Tk after DPI awareness is set
+            dpi = float(self.winfo_fpixels("1i"))
+            if dpi > 0:
+                self.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
+
+    def _fit_to_content(self):
+        """Default geometry = required content size; window stays resizable."""
+        self.update_idletasks()
+        width = max(self.winfo_reqwidth(), 1)
+        height = max(self.winfo_reqheight(), 1)
+        # Small padding so borders/status aren't clipped on some themes
+        width += 8
+        height += 8
+        self.minsize(width, height)
+        self.geometry(f"{width}x{height}")
+        self.resizable(True, True)
+
     def resource_path(self, relative_path):
         try:
             base_path = sys._MEIPASS
@@ -562,5 +617,6 @@ class App(tk.Tk):
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
+    enable_windows_dpi_awareness()
     app = App()
     app.mainloop()
