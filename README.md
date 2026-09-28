@@ -1,12 +1,15 @@
 # Yamaha Discord RPC
 
-A lightweight Discord-based remote control for Yamaha receivers using
-the Yamaha Extended Control API (YXC).
+A lightweight Discord Rich Presence client for Yamaha receivers (YXC) and
+optionally Navidrome (Subsonic API) now-playing.
 
 ## Features
 
 -   Display current playing song on Discord RPC
--   Shows Album Art if LastFM api is given (Falls back to your default picture)
+-   Shows as **Listening to (Artist)** (Spotify-style), not Playing
+-   Yamaha MusicCast and/or Navidrome (any of your devices)
+-   Source mode: `auto` (prefer Navidrome when actively playing, else Yamaha), `yamaha`, or `navidrome`
+-   Shows album art via public HTTPS covers (Last.fm if keyed, else iTunes Search)
 -   Shows current timestamp
 
 Playback control is **not supported**, as the Yamaha API does not expose
@@ -17,11 +20,15 @@ play/pause for most sources.
 ## Requirements
 
 -   Python 3.10+
+-   `pypresence` 4.6+ (for Listening activity type)
 -   A Yamaha AVR that supports the YXC API (RX-V6A, RX-A2A, etc.)
--   A Discord Bot Token
 -   Your Discord Application ID
--   Your Yamaha device's IP address
+-   Your Yamaha device's IP address (optional if using Navidrome only)
+-   Navidrome base URL + username + password (optional if using Yamaha only)
 -   LastFM api key (Optional)
+
+Navidrome credentials are saved in `yamaha_rpc_config.json` (or via env
+`NAVIDROME_URL`, `NAVIDROME_USER`, `NAVIDROME_PASSWORD`). Do not commit that file.
 
 ------------------------------------------------------------------------
 
@@ -47,11 +54,19 @@ You can find this on your receiver:
 
 Install dependencies:
 
-    pip install requests python-dotenv
+    pip install -r requirements.txt
 
 Run:
 
     python yamaha_rpc_gui.py
+
+### 6. Windows exe (optional)
+
+A one-file Windows build is produced by GitHub Actions (`Build Windows exe`) or locally on Windows:
+
+    powershell -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+
+Output: `dist/YamahaDiscordRPC.exe` (unsigned — SmartScreen may warn on first run).
 
 ------------------------------------------------------------------------
 

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Yamaha RX-V6A → Discord RPC (GUI)
+Yamaha RX-V6A / Navidrome → Discord RPC (GUI)
 Features:
 - Tray icon support, minimize to tray
 - Restore GUI on double-click tray icon
 - Album art caching via Last.fm
-- User inputs Yamaha IP, Discord Client ID, Last.fm key
+- Yamaha MusicCast and/or Navidrome (Subsonic) now-playing
+- User inputs Yamaha IP, Navidrome URL/creds, Discord Client ID, Last.fm key
 - No console logging
 - Requires: Python 3.10+, requests, pypresence, pystray, pillow, tkinter
 """
@@ -16,15 +17,67 @@ import threading
 import requests
 import json
 import time
+import hashlib
+import secrets
 from pypresence import Presence
+from pypresence.payloads import Payload
 import os
 import pystray
 from PIL import Image
 import sys
 
-CONFIG_FILE = "yamaha_rpc_config.json"
-CACHE_FILE = "cache.json"
+APP_VERSION = "1.1.5"
+# Discord activity.type: 0=Playing, 2=Listening, 3=Watching, 5=Competing
+ACTIVITY_LISTENING = 2
+# status_display_type: 0=app name, 1=state, 2=details → "Listening to {artist}"
+STATUS_DISPLAY_STATE = 1
+# Discord large_image max length; asset keys / URLs above this are dropped.
+MAX_IMAGE_KEY_LEN = 256
 GENERIC_IMAGE = "3844724"
+SUBSONIC_API_VERSION = "1.16.1"
+SUBSONIC_CLIENT = "YamahaRPC"
+SOURCE_MODES = ("auto", "yamaha", "navidrome")
+
+
+def app_dir():
+    """Writable directory next to the exe when frozen; otherwise cwd."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.abspath(".")
+
+
+CONFIG_FILE = os.path.join(app_dir(), "yamaha_rpc_config.json")
+CACHE_FILE = os.path.join(app_dir(), "cache.json")
+
+
+def enable_windows_dpi_awareness():
+    """Tell Windows this process is DPI-aware so Tk is not bitmap-upscaled (blurry).
+
+    Must run before the first Tk() / tk.Tk() is created.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # Per-monitor DPI awareness V2 (Windows 10 1703+)
+        # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 == -4
+        ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        # PROCESS_PER_MONITOR_DPI_AWARE == 2
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
 
 # ---------------- Cache ----------------
 class Cache:
@@ -48,14 +101,70 @@ class Cache:
         except:
             pass
 
-    def get_album_art(self, artist, album):
-        return self.data.get("album_art", {}).get(f"{artist}|{album}")
+    def get_album_art(self, key, kind="url"):
+        return self.data.get("album_art", {}).get(f"{kind}|{key}")
 
-    def set_album_art(self, artist, album, url):
+    def set_album_art(self, key, kind, url):
         if "album_art" not in self.data:
             self.data["album_art"] = {}
-        self.data["album_art"][f"{artist}|{album}"] = url
+        self.data["album_art"][f"{kind}|{key}"] = url
         self.save()
+
+# ---------------- Helpers ----------------
+def env_or_config(config, key, env_name):
+    env_val = os.environ.get(env_name, "").strip()
+    if env_val:
+        return env_val
+    return (config.get(key) or "").strip()
+
+
+def normalize_base_url(url):
+    url = (url or "").strip().rstrip("/")
+    if url.endswith("/rest"):
+        url = url[:-5]
+    return url
+
+
+def discord_safe_image_url(url):
+    """Discord needs https image URLs (or asset keys), max 256 chars."""
+    if not url:
+        return None
+    url = str(url).strip()
+    if not url:
+        return None
+    if url.startswith("mp:"):
+        return url if len(url) <= MAX_IMAGE_KEY_LEN else None
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://") :]
+    if not (url.startswith("https://") or url.startswith("http://")):
+        # Treat as Discord Developer Portal asset key
+        return url if len(url) <= MAX_IMAGE_KEY_LEN else None
+    if len(url) > MAX_IMAGE_KEY_LEN:
+        return None
+    return url
+
+
+def is_public_http_host(url):
+    """True if Discord's CDN is likely able to fetch this host (not LAN/loopback)."""
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+        if not host or host == "localhost" or host.endswith(".local"):
+            return False
+        import ipaddress
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_global
+        except ValueError:
+            # hostname — assume public unless clearly local
+            return True
+    except Exception:
+        return False
+
 
 # ---------------- Yamaha RPC Bridge ----------------
 class YamahaRPCBridge(threading.Thread):
@@ -94,45 +203,271 @@ class YamahaRPCBridge(threading.Thread):
     def get_yamaha_info(self):
         try:
             ip = self.config.get("yamaha_ip")
+            if not ip:
+                return None
             url = f"http://{ip}/YamahaExtendedControl/v1/netusb/getPlayInfo"
             r = requests.get(url, timeout=3)
             r.raise_for_status()
             js = r.json()
             if js.get("playback", "").lower() != "play":
                 return None
+            art = js.get("albumart_url") or js.get("albumart_url2") or ""
+            if art and art.startswith("/"):
+                art = f"http://{ip}{art}"
             return {
                 "track": js.get("track"),
                 "artist": js.get("artist"),
                 "album": js.get("album"),
                 "play_time": js.get("play_time", 0),
+                "source": "yamaha",
+                "cover_url": art or None,
             }
         except:
             return None
 
-    def get_album_art(self, artist, album):
-        cached = self.cache.get_album_art(artist, album)
-        if cached:
-            return cached
+    def _navidrome_auth_params(self):
+        base = normalize_base_url(
+            env_or_config(self.config, "navidrome_url", "NAVIDROME_URL")
+        )
+        user = env_or_config(self.config, "navidrome_user", "NAVIDROME_USER")
+        password = env_or_config(
+            self.config, "navidrome_password", "NAVIDROME_PASSWORD"
+        )
+        if not base or not user or not password:
+            return None, None
+        salt = secrets.token_hex(8)
+        token = hashlib.md5((password + salt).encode("utf-8")).hexdigest()
+        params = {
+            "u": user,
+            "t": token,
+            "s": salt,
+            "v": SUBSONIC_API_VERSION,
+            "c": SUBSONIC_CLIENT,
+            "f": "json",
+        }
+        return base, params
+
+    def _subsonic_get(self, endpoint, extra=None):
+        base, params = self._navidrome_auth_params()
+        if not base:
+            return None
+        query = dict(params)
+        if extra:
+            query.update(extra)
+        url = f"{base}/rest/{endpoint}.view"
+        r = requests.get(url, params=query, timeout=5)
+        r.raise_for_status()
+        js = r.json()
+        resp = js.get("subsonic-response") or {}
+        if resp.get("status") != "ok":
+            return None
+        return resp
+
+    def navidrome_cover_url(self, cover_art_id):
+        """Build a Subsonic getCoverArt URL (only useful if Navidrome is publicly reachable)."""
+        if not cover_art_id:
+            return None
+        base, params = self._navidrome_auth_params()
+        if not base:
+            return None
+        query = dict(params)
+        query["id"] = cover_art_id
+        query["size"] = "600"
+        # requests prepares encoding; build manually for a stable cache key
+        from urllib.parse import urlencode
+
+        return f"{base}/rest/getCoverArt.view?{urlencode(query)}"
+
+    def _navidrome_entry_to_info(self, entry, player_name=None):
+        if not entry:
+            return None
+        title = entry.get("title") or entry.get("name")
+        artist = entry.get("displayArtist") or entry.get("artist") or ""
+        album = entry.get("album") or ""
+        if not title:
+            return None
+        play_time = 0
+        if entry.get("positionMs") is not None:
+            try:
+                play_time = max(0, int(entry["positionMs"]) // 1000)
+            except (TypeError, ValueError):
+                play_time = 0
+        cover_id = entry.get("coverArt") or entry.get("id")
+        info = {
+            "track": title,
+            "artist": artist,
+            "album": album,
+            "play_time": play_time,
+            "source": "navidrome",
+            "player": player_name or entry.get("playerName") or "",
+            "cover_art_id": cover_id,
+            "cover_url": self.navidrome_cover_url(cover_id),
+        }
+        return info
+
+    def get_navidrome_info(self):
+        """Return currently playing track from any of the user's Navidrome devices."""
+        try:
+            base, params = self._navidrome_auth_params()
+            if not base:
+                return None
+            configured_user = params["u"]
+            resp = self._subsonic_get("getNowPlaying")
+            if not resp:
+                return None
+            entries = (resp.get("nowPlaying") or {}).get("entry") or []
+            if isinstance(entries, dict):
+                entries = [entries]
+
+            candidates = []
+            for entry in entries:
+                username = entry.get("username") or ""
+                if username and username != configured_user:
+                    continue
+                state = (entry.get("state") or "").lower()
+                try:
+                    minutes_ago = int(entry.get("minutesAgo", 9999))
+                except (TypeError, ValueError):
+                    minutes_ago = 9999
+                # Prefer explicit OpenSubsonic playing state; otherwise recent scrobble.
+                if state == "playing":
+                    score = 0
+                elif state in ("paused", "stopped"):
+                    continue
+                elif minutes_ago <= 2:
+                    score = 1 + minutes_ago
+                else:
+                    continue
+                candidates.append((score, minutes_ago, entry))
+
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: (item[0], item[1]))
+            return self._navidrome_entry_to_info(candidates[0][2])
+        except:
+            return None
+
+    def resolve_now_playing(self):
+        mode = (self.config.get("source_mode") or "auto").strip().lower()
+        if mode not in SOURCE_MODES:
+            mode = "auto"
+
+        if mode == "yamaha":
+            return self.get_yamaha_info()
+        if mode == "navidrome":
+            return self.get_navidrome_info()
+
+        # auto: prefer Navidrome when it reports an active play, else Yamaha
+        navidrome = self.get_navidrome_info()
+        if navidrome:
+            return navidrome
+        return self.get_yamaha_info()
+
+    def get_lastfm_art(self, artist, album):
         try:
             api_key = self.config.get("lastfm_api_key")
-            if not api_key:
+            if not api_key or not artist or not album:
                 return None
             url = (
-                f"http://ws.audioscrobbler.com/2.0/"
+                f"https://ws.audioscrobbler.com/2.0/"
                 f"?method=album.getinfo&api_key={api_key}"
-                f"&artist={requests.utils.quote(artist)}&album={requests.utils.quote(album)}&format=json"
+                f"&artist={requests.utils.quote(artist)}"
+                f"&album={requests.utils.quote(album)}&format=json"
             )
-            r = requests.get(url, timeout=3).json()
+            r = requests.get(url, timeout=4).json()
             if "album" in r and "image" in r["album"]:
                 images = r["album"]["image"]
                 if images:
-                    album_art_url = images[-1].get("#text") or None
-                    if album_art_url:
-                        self.cache.set_album_art(artist, album, album_art_url)
-                        return album_art_url
+                    # Prefer largest; Last.fm often returns http — normalize later
+                    for img in reversed(images):
+                        album_art_url = (img or {}).get("#text") or None
+                        if album_art_url:
+                            return album_art_url
             return None
-        except:
+        except Exception:
             return None
+
+    def get_itunes_art(self, artist, album, track=None):
+        """Public HTTPS artwork via iTunes Search (no API key)."""
+        try:
+            term = " ".join(p for p in (artist, album or track) if p).strip()
+            if not term:
+                return None
+            r = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": term, "entity": "album", "limit": 5},
+                timeout=4,
+            )
+            r.raise_for_status()
+            results = (r.json() or {}).get("results") or []
+            album_l = (album or "").strip().lower()
+            artist_l = (artist or "").strip().lower()
+            best = None
+            for item in results:
+                art = item.get("artworkUrl100") or item.get("artworkUrl60")
+                if not art:
+                    continue
+                # Prefer matching album/artist when possible
+                coll = (item.get("collectionName") or "").lower()
+                art_name = (item.get("artistName") or "").lower()
+                score = 0
+                if album_l and album_l in coll:
+                    score += 2
+                if artist_l and artist_l in art_name:
+                    score += 2
+                if best is None or score > best[0]:
+                    best = (score, art)
+                if score >= 4:
+                    break
+            if not best:
+                return None
+            # Upscale common 100x100 artwork URL to 600x600
+            art = best[1].replace("100x100bb", "600x600bb").replace("60x60bb", "600x600bb")
+            return art
+        except Exception:
+            return None
+
+    def resolve_cover_for_discord(self, info):
+        """
+        Return a Discord-usable large_image value (https URL preferred).
+        LAN-only covers (Yamaha / private Navidrome) are skipped — Discord
+        cannot fetch them for other users — and we fall back to Last.fm / iTunes.
+        """
+        artist = (info.get("artist") or "").strip()
+        album = (info.get("album") or "").strip()
+        track = (info.get("track") or "").strip()
+        cache_key = f"{info.get('source')}|{artist}|{album}|{track}"
+
+        cached = self.cache.get_album_art(cache_key, "discord")
+        if cached:
+            return cached
+
+        candidates = []
+
+        # 1) Last.fm (public CDN)
+        lastfm = self.get_lastfm_art(artist, album)
+        if lastfm:
+            candidates.append(lastfm)
+
+        # 2) iTunes (public, no key)
+        itunes = self.get_itunes_art(artist, album, track)
+        if itunes:
+            candidates.append(itunes)
+
+        # 3) Source-provided URL only if publicly reachable
+        source_cover = info.get("cover_url")
+        if source_cover and is_public_http_host(source_cover):
+            candidates.append(source_cover)
+
+        for raw in candidates:
+            safe = discord_safe_image_url(raw)
+            if safe and safe.startswith("https://"):
+                self.cache.set_album_art(cache_key, "discord", safe)
+                return safe
+
+        # Last resort: uploaded Discord asset key (only works if registered
+        # under this application in the Developer Portal).
+        return GENERIC_IMAGE
 
     def run(self):
         self._set_status("Connecting to Discord...")
@@ -141,28 +476,74 @@ class YamahaRPCBridge(threading.Thread):
             self._set_status(f"Discord connect error: {err}")
             return
 
-        self._set_status("Connected. Polling Yamaha...")
+        mode = (self.config.get("source_mode") or "auto").strip().lower()
+        self._set_status(f"Connected. Polling ({mode})...")
         poll = float(self.config.get("poll_interval", 2))
         while not self._stop.is_set():
-            info = self.get_yamaha_info()
+            info = self.resolve_now_playing()
             if info:
-                track_id = f"{info['artist']}|{info['album']}|{info['track']}"
+                track_id = f"{info.get('source')}|{info['artist']}|{info['album']}|{info['track']}"
                 if track_id != self.last_track:
                     self.last_track = track_id
-                    album_art_url = self.get_album_art(info["artist"], info["album"])
-                    kwargs = {
-                        "details": info["track"],
-                        "state": f"{info['artist']} — {info['album']}",
-                        "large_image": album_art_url if album_art_url else GENERIC_IMAGE,
-                        "large_text": "Playing music",
-                        "start": int(time.time()) - int(info.get("play_time", 0))
+                    cover = self.resolve_cover_for_discord(info)
+                    source_label = "Navidrome" if info.get("source") == "navidrome" else "Yamaha"
+                    player = info.get("player") or ""
+                    artist = info["artist"] or "Unknown artist"
+                    album = info["album"] or ""
+                    track = info["track"] or "Unknown track"
+                    # "Listening to Playing music" means Discord is using the
+                    # Developer Portal app name. Override `name` with the artist
+                    # and keep status_display_type=STATE as a second path.
+                    large_text = album or f"via {source_label}"
+                    if player:
+                        large_text = f"{source_label}: {player}"
+                    start_ts = int(time.time()) - int(info.get("play_time", 0) or 0)
+                    activity = {
+                        "type": ACTIVITY_LISTENING,
+                        "name": artist,
+                        "status_display_type": STATUS_DISPLAY_STATE,
+                        "details": track,
+                        "state": artist,
+                        "assets": {
+                            "large_image": cover,
+                            "large_text": large_text,
+                        },
+                        "timestamps": {"start": start_ts},
+                        "instance": True,
                     }
                     try:
                         if self.rpc:
-                            self.rpc.update(**kwargs)
-                        self._set_status(f'Playing: {info["artist"]} — {info["track"]}')
-                    except:
-                        self._set_status("RPC update error")
+                            # Prefer payload_override so type=2 is never dropped
+                            # by older pypresence wrappers / missing enums.
+                            try:
+                                self.rpc.update(
+                                    payload_override=Payload(
+                                        {
+                                            "cmd": "SET_ACTIVITY",
+                                            "args": {
+                                                "pid": os.getpid(),
+                                                "activity": activity,
+                                            },
+                                            "nonce": f"{time.time():.20f}",
+                                        },
+                                        clear_none=False,
+                                    )
+                                )
+                            except TypeError:
+                                # Very old pypresence without payload_override
+                                self.rpc.update(
+                                    details=track,
+                                    state=artist,
+                                    large_image=cover,
+                                    large_text=large_text,
+                                    start=start_ts,
+                                )
+                        cover_note = "cover" if cover.startswith("https://") else "no cover"
+                        self._set_status(
+                            f"Listening to {artist} — {track} ({source_label}, {cover_note})"
+                        )
+                    except Exception as e:
+                        self._set_status(f"RPC update error: {e}")
             else:
                 try:
                     if self.rpc:
@@ -183,50 +564,212 @@ class YamahaRPCBridge(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Yamaha RX-V6A → Discord RPC")
-        self.geometry("520x380")
+        self.title(f"Yamaha / Navidrome → Discord RPC v{APP_VERSION}")
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        self._last_dpi = None
+        self._dpi_check_after = None
+        self._apply_dpi_scaling(force=True)
 
         self.config_data = self.load_config()
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
 
+        row = 0
+
+        # Source mode
+        ttk.Label(frm, text="Source mode:").grid(row=row, column=0, sticky="w")
+        self.source_var = tk.StringVar(
+            value=self.config_data.get("source_mode", "auto")
+        )
+        self.source_combo = ttk.Combobox(
+            frm,
+            textvariable=self.source_var,
+            values=list(SOURCE_MODES),
+            state="readonly",
+            width=28,
+        )
+        self.source_combo.grid(row=row, column=1, padx=6, pady=6, sticky="w")
+        row += 1
+
         # Yamaha IP
-        ttk.Label(frm, text="Yamaha IP:").grid(row=0, column=0, sticky="w")
-        self.ip_var = tk.StringVar(value=self.config_data.get("yamaha_ip",""))
-        ttk.Entry(frm, textvariable=self.ip_var, width=30).grid(row=0, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(frm, text="Yamaha IP:").grid(row=row, column=0, sticky="w")
+        self.ip_var = tk.StringVar(value=self.config_data.get("yamaha_ip", ""))
+        ttk.Entry(frm, textvariable=self.ip_var, width=30).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
+
+        # Navidrome URL
+        ttk.Label(frm, text="Navidrome URL:").grid(row=row, column=0, sticky="w")
+        self.nd_url_var = tk.StringVar(
+            value=self.config_data.get("navidrome_url", "")
+        )
+        ttk.Entry(frm, textvariable=self.nd_url_var, width=30).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
+
+        # Navidrome username
+        ttk.Label(frm, text="Navidrome Username:").grid(row=row, column=0, sticky="w")
+        self.nd_user_var = tk.StringVar(
+            value=self.config_data.get("navidrome_user", "")
+        )
+        ttk.Entry(frm, textvariable=self.nd_user_var, width=30).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
+
+        # Navidrome password
+        ttk.Label(frm, text="Navidrome Password:").grid(row=row, column=0, sticky="w")
+        self.nd_pass_var = tk.StringVar(
+            value=self.config_data.get("navidrome_password", "")
+        )
+        ttk.Entry(frm, textvariable=self.nd_pass_var, width=30, show="*").grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
 
         # Discord Client ID
-        ttk.Label(frm, text="Discord Client ID:").grid(row=1, column=0, sticky="w")
-        self.cid_var = tk.StringVar(value=self.config_data.get("discord_client_id",""))
-        ttk.Entry(frm, textvariable=self.cid_var, width=30).grid(row=1, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(frm, text="Discord Client ID:").grid(row=row, column=0, sticky="w")
+        self.cid_var = tk.StringVar(
+            value=self.config_data.get("discord_client_id", "")
+        )
+        ttk.Entry(frm, textvariable=self.cid_var, width=30).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
 
         # Last.fm API Key
-        ttk.Label(frm, text="Last.fm API Key:").grid(row=2, column=0, sticky="w")
-        self.lfm_var = tk.StringVar(value=self.config_data.get("lastfm_api_key",""))
-        ttk.Entry(frm, textvariable=self.lfm_var, width=30).grid(row=2, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(frm, text="Last.fm API Key:").grid(row=row, column=0, sticky="w")
+        self.lfm_var = tk.StringVar(
+            value=self.config_data.get("lastfm_api_key", "")
+        )
+        ttk.Entry(frm, textvariable=self.lfm_var, width=30).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
 
         # Poll interval
-        ttk.Label(frm, text="Poll Interval (seconds):").grid(row=3, column=0, sticky="w")
-        self.poll_var = tk.StringVar(value=str(self.config_data.get("poll_interval",2)))
-        ttk.Entry(frm, textvariable=self.poll_var, width=10).grid(row=3, column=1, padx=6, pady=6, sticky="w")
+        ttk.Label(frm, text="Poll Interval (seconds):").grid(
+            row=row, column=0, sticky="w"
+        )
+        self.poll_var = tk.StringVar(
+            value=str(self.config_data.get("poll_interval", 2))
+        )
+        ttk.Entry(frm, textvariable=self.poll_var, width=10).grid(
+            row=row, column=1, padx=6, pady=6, sticky="w"
+        )
+        row += 1
 
         # Start/Stop buttons
-        self.start_btn = ttk.Button(frm, text="Start", command=self.start_bridge, width=12)
-        self.start_btn.grid(row=4, column=0, pady=6)
-        self.stop_btn = ttk.Button(frm, text="Stop", command=self.stop_bridge, width=12, state="disabled")
-        self.stop_btn.grid(row=4, column=1, pady=6, sticky="w")
+        self.start_btn = ttk.Button(
+            frm, text="Start", command=self.start_bridge, width=12
+        )
+        self.start_btn.grid(row=row, column=0, pady=6)
+        self.stop_btn = ttk.Button(
+            frm, text="Stop", command=self.stop_bridge, width=12, state="disabled"
+        )
+        self.stop_btn.grid(row=row, column=1, pady=6, sticky="w")
+        row += 1
 
         # Status
         self.status_var = tk.StringVar(value="Stopped")
-        ttk.Label(frm, text="Status:").grid(row=5, column=0, sticky="w")
+        ttk.Label(frm, text="Status:").grid(row=row, column=0, sticky="w")
         self.status_lbl = ttk.Label(frm, textvariable=self.status_var)
-        self.status_lbl.grid(row=5, column=1, sticky="w")
+        self.status_lbl.grid(row=row, column=1, sticky="w")
 
-        # Tray icon setup
+        # Size to content; keep resizable with a sensible minimum
+        self._apply_dpi_scaling(force=True)
+        self._fit_to_content()
+
+        # Tray icon setup — minimize and close both hide to tray
         self.tray_icon = None
+        self._tray_hiding = False
+        self.bind("<Unmap>", self._on_unmap)
+        # Re-scale when the window moves to a monitor with a different DPI
+        self.bind("<Configure>", self._on_configure)
 
     # ---------------- Helper Methods ----------------
+    def _get_window_dpi(self):
+        """Current monitor DPI for this window (Windows GetDpiForWindow when available)."""
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = int(self.winfo_id())
+                # Prefer top-level HWND — Tk's winfo_id may be a child frame
+                GA_ROOT = 2
+                root = ctypes.windll.user32.GetAncestor(hwnd, GA_ROOT)
+                if root:
+                    hwnd = root
+                dpi = int(ctypes.windll.user32.GetDpiForWindow(hwnd))
+                if dpi > 0:
+                    return float(dpi)
+            except Exception:
+                pass
+        try:
+            dpi = float(self.winfo_fpixels("1i"))
+            if dpi > 0:
+                return dpi
+        except Exception:
+            pass
+        return 96.0
+
+    def _apply_dpi_scaling(self, force=False):
+        """Align Tk scaling with the display DPI for this window.
+
+        Returns True if scaling changed.
+        """
+        try:
+            dpi = self._get_window_dpi()
+            if not force and self._last_dpi is not None and abs(dpi - self._last_dpi) < 0.5:
+                return False
+            self._last_dpi = dpi
+            self.tk.call("tk", "scaling", dpi / 72.0)
+            return True
+        except Exception:
+            return False
+
+    def _on_configure(self, event):
+        if event.widget is not self:
+            return
+        # Debounce rapid Configure events while dragging between monitors
+        if self._dpi_check_after is not None:
+            try:
+                self.after_cancel(self._dpi_check_after)
+            except Exception:
+                pass
+        self._dpi_check_after = self.after(120, self._maybe_update_monitor_dpi)
+
+    def _maybe_update_monitor_dpi(self):
+        self._dpi_check_after = None
+        try:
+            if self.state() != "normal":
+                return
+        except tk.TclError:
+            return
+        if self._apply_dpi_scaling():
+            # Refit minsize/content so 1440p→1080p (and reverse) stays proportional
+            self._fit_to_content(resize=True)
+
+    def _fit_to_content(self, resize=True):
+        """Default geometry = required content size; window stays resizable."""
+        self.update_idletasks()
+        width = max(self.winfo_reqwidth(), 1)
+        height = max(self.winfo_reqheight(), 1)
+        # Small padding so borders/status aren't clipped on some themes
+        width += 8
+        height += 8
+        self.minsize(width, height)
+        if resize:
+            # Keep current top-left when only size changes after a DPI switch
+            try:
+                x = self.winfo_x()
+                y = self.winfo_y()
+                self.geometry(f"{width}x{height}+{x}+{y}")
+            except tk.TclError:
+                self.geometry(f"{width}x{height}")
+        self.resizable(True, True)
+
     def resource_path(self, relative_path):
         try:
             base_path = sys._MEIPASS
@@ -234,42 +777,111 @@ class App(tk.Tk):
             base_path = os.path.abspath(".")
         return os.path.join(base_path, relative_path)
 
+    def _on_unmap(self, event):
+        """Minimize button → tray (not a taskbar-iconified window)."""
+        if event.widget is not self or self._tray_hiding:
+            return
+        try:
+            if self.state() != "iconic":
+                return
+        except tk.TclError:
+            return
+        # Defer so Windows finishes the iconify before we withdraw (less flicker)
+        self._tray_hiding = True
+        self.after(0, self._minimize_to_tray)
+
+    def _minimize_to_tray(self):
+        try:
+            self.hide_to_tray()
+        finally:
+            self._tray_hiding = False
+
     def create_tray_icon(self):
-        icon_image = Image.open(self.resource_path("3844724.png"))
-        self.tray_icon = pystray.Icon("YamahaRPC")
-        self.tray_icon.icon = icon_image
-        self.tray_icon.title = "Yamaha Discord RPC"
-        self.tray_icon.menu = pystray.Menu(pystray.MenuItem("Quit", self.quit_app))
-        # double-click restores GUI
-        self.tray_icon.run_detached()
-        self.tray_icon.visible = True
-        self.tray_icon._on_double_click = lambda icon, item: self.restore_from_tray()
+        try:
+            icon_path = self.resource_path("3844724.png")
+            if os.path.exists(icon_path):
+                icon_image = Image.open(icon_path)
+            else:
+                icon_image = Image.new("RGB", (64, 64), color=(32, 40, 52))
+            self.tray_icon = pystray.Icon(
+                "YamahaRPC",
+                icon_image,
+                "Yamaha Discord RPC",
+                menu=pystray.Menu(
+                    pystray.MenuItem(
+                        "Show",
+                        self._tray_show,
+                        default=True,
+                    ),
+                    pystray.MenuItem("Quit", self._tray_quit),
+                ),
+            )
+            self.tray_icon.run_detached()
+            self.tray_icon.visible = True
+        except Exception:
+            self.tray_icon = None
+
+    def _tray_show(self, icon=None, item=None):
+        # pystray callbacks run off the Tk thread
+        self.after(0, self.restore_from_tray)
+
+    def _tray_quit(self, icon=None, item=None):
+        self.after(0, self.quit_app)
 
     def hide_to_tray(self):
-        self.withdraw()
+        try:
+            # withdraw removes taskbar button; preferred over staying iconic
+            self.withdraw()
+        except tk.TclError:
+            pass
         if not self.tray_icon:
             self.create_tray_icon()
+        elif self.tray_icon:
+            try:
+                self.tray_icon.visible = True
+            except Exception:
+                pass
 
     def restore_from_tray(self):
-        self.deiconify()
-        self.lift()
+        try:
+            self.deiconify()
+            self.lift()
+            self.focus_force()
+        except tk.TclError:
+            pass
+        # Monitor may have changed while in tray — refresh DPI
+        self.after(50, self._maybe_update_monitor_dpi)
         if self.tray_icon:
-            self.tray_icon.visible = False
+            try:
+                self.tray_icon.visible = False
+            except Exception:
+                pass
 
     def quit_app(self, icon=None):
         if hasattr(self, "bridge") and self.bridge.running():
             self.bridge.stop()
             time.sleep(0.2)
         if self.tray_icon:
-            self.tray_icon.stop()
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+            self.tray_icon = None
         self.destroy()
 
     def save_config(self):
+        mode = (self.source_var.get() or "auto").strip().lower()
+        if mode not in SOURCE_MODES:
+            mode = "auto"
         data = {
+            "source_mode": mode,
             "yamaha_ip": self.ip_var.get().strip(),
+            "navidrome_url": self.nd_url_var.get().strip(),
+            "navidrome_user": self.nd_user_var.get().strip(),
+            "navidrome_password": self.nd_pass_var.get().strip(),
             "discord_client_id": self.cid_var.get().strip(),
             "lastfm_api_key": self.lfm_var.get().strip(),
-            "poll_interval": float(self.poll_var.get().strip() or 2)
+            "poll_interval": float(self.poll_var.get().strip() or 2),
         }
         try:
             with open(CONFIG_FILE, "w") as f:
@@ -314,5 +926,6 @@ class App(tk.Tk):
 
 # ---------------- Main ----------------
 if __name__ == "__main__":
+    enable_windows_dpi_awareness()
     app = App()
     app.mainloop()
