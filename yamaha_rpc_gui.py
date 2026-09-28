@@ -26,11 +26,13 @@ import pystray
 from PIL import Image
 import sys
 
-APP_VERSION = "1.1.3"
+APP_VERSION = "1.1.4"
 # Discord activity.type: 0=Playing, 2=Listening, 3=Watching, 5=Competing
 ACTIVITY_LISTENING = 2
 # status_display_type: 0=app name, 1=state, 2=details → "Listening to {artist}"
 STATUS_DISPLAY_STATE = 1
+# Discord large_image max length; asset keys / URLs above this are dropped.
+MAX_IMAGE_KEY_LEN = 256
 GENERIC_IMAGE = "3844724"
 SUBSONIC_API_VERSION = "1.16.1"
 SUBSONIC_CLIENT = "YamahaRPC"
@@ -99,13 +101,13 @@ class Cache:
         except:
             pass
 
-    def get_album_art(self, artist, album):
-        return self.data.get("album_art", {}).get(f"{artist}|{album}")
+    def get_album_art(self, key, kind="url"):
+        return self.data.get("album_art", {}).get(f"{kind}|{key}")
 
-    def set_album_art(self, artist, album, url):
+    def set_album_art(self, key, kind, url):
         if "album_art" not in self.data:
             self.data["album_art"] = {}
-        self.data["album_art"][f"{artist}|{album}"] = url
+        self.data["album_art"][f"{kind}|{key}"] = url
         self.save()
 
 # ---------------- Helpers ----------------
@@ -121,6 +123,47 @@ def normalize_base_url(url):
     if url.endswith("/rest"):
         url = url[:-5]
     return url
+
+
+def discord_safe_image_url(url):
+    """Discord needs https image URLs (or asset keys), max 256 chars."""
+    if not url:
+        return None
+    url = str(url).strip()
+    if not url:
+        return None
+    if url.startswith("mp:"):
+        return url if len(url) <= MAX_IMAGE_KEY_LEN else None
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("http://"):
+        url = "https://" + url[len("http://") :]
+    if not (url.startswith("https://") or url.startswith("http://")):
+        # Treat as Discord Developer Portal asset key
+        return url if len(url) <= MAX_IMAGE_KEY_LEN else None
+    if len(url) > MAX_IMAGE_KEY_LEN:
+        return None
+    return url
+
+
+def is_public_http_host(url):
+    """True if Discord's CDN is likely able to fetch this host (not LAN/loopback)."""
+    try:
+        from urllib.parse import urlparse
+
+        host = (urlparse(url).hostname or "").lower()
+        if not host or host == "localhost" or host.endswith(".local"):
+            return False
+        import ipaddress
+
+        try:
+            ip = ipaddress.ip_address(host)
+            return ip.is_global
+        except ValueError:
+            # hostname — assume public unless clearly local
+            return True
+    except Exception:
+        return False
 
 
 # ---------------- Yamaha RPC Bridge ----------------
@@ -168,12 +211,16 @@ class YamahaRPCBridge(threading.Thread):
             js = r.json()
             if js.get("playback", "").lower() != "play":
                 return None
+            art = js.get("albumart_url") or js.get("albumart_url2") or ""
+            if art and art.startswith("/"):
+                art = f"http://{ip}{art}"
             return {
                 "track": js.get("track"),
                 "artist": js.get("artist"),
                 "album": js.get("album"),
                 "play_time": js.get("play_time", 0),
                 "source": "yamaha",
+                "cover_url": art or None,
             }
         except:
             return None
@@ -216,6 +263,21 @@ class YamahaRPCBridge(threading.Thread):
             return None
         return resp
 
+    def navidrome_cover_url(self, cover_art_id):
+        """Build a Subsonic getCoverArt URL (only useful if Navidrome is publicly reachable)."""
+        if not cover_art_id:
+            return None
+        base, params = self._navidrome_auth_params()
+        if not base:
+            return None
+        query = dict(params)
+        query["id"] = cover_art_id
+        query["size"] = "600"
+        # requests prepares encoding; build manually for a stable cache key
+        from urllib.parse import urlencode
+
+        return f"{base}/rest/getCoverArt.view?{urlencode(query)}"
+
     def _navidrome_entry_to_info(self, entry, player_name=None):
         if not entry:
             return None
@@ -230,6 +292,7 @@ class YamahaRPCBridge(threading.Thread):
                 play_time = max(0, int(entry["positionMs"]) // 1000)
             except (TypeError, ValueError):
                 play_time = 0
+        cover_id = entry.get("coverArt") or entry.get("id")
         info = {
             "track": title,
             "artist": artist,
@@ -237,7 +300,8 @@ class YamahaRPCBridge(threading.Thread):
             "play_time": play_time,
             "source": "navidrome",
             "player": player_name or entry.get("playerName") or "",
-            "cover_art_id": entry.get("coverArt") or entry.get("id"),
+            "cover_art_id": cover_id,
+            "cover_url": self.navidrome_cover_url(cover_id),
         }
         return info
 
@@ -299,30 +363,111 @@ class YamahaRPCBridge(threading.Thread):
             return navidrome
         return self.get_yamaha_info()
 
-    def get_album_art(self, artist, album):
-        cached = self.cache.get_album_art(artist, album)
-        if cached:
-            return cached
+    def get_lastfm_art(self, artist, album):
         try:
             api_key = self.config.get("lastfm_api_key")
-            if not api_key:
+            if not api_key or not artist or not album:
                 return None
             url = (
-                f"http://ws.audioscrobbler.com/2.0/"
+                f"https://ws.audioscrobbler.com/2.0/"
                 f"?method=album.getinfo&api_key={api_key}"
-                f"&artist={requests.utils.quote(artist)}&album={requests.utils.quote(album)}&format=json"
+                f"&artist={requests.utils.quote(artist)}"
+                f"&album={requests.utils.quote(album)}&format=json"
             )
-            r = requests.get(url, timeout=3).json()
+            r = requests.get(url, timeout=4).json()
             if "album" in r and "image" in r["album"]:
                 images = r["album"]["image"]
                 if images:
-                    album_art_url = images[-1].get("#text") or None
-                    if album_art_url:
-                        self.cache.set_album_art(artist, album, album_art_url)
-                        return album_art_url
+                    # Prefer largest; Last.fm often returns http — normalize later
+                    for img in reversed(images):
+                        album_art_url = (img or {}).get("#text") or None
+                        if album_art_url:
+                            return album_art_url
             return None
-        except:
+        except Exception:
             return None
+
+    def get_itunes_art(self, artist, album, track=None):
+        """Public HTTPS artwork via iTunes Search (no API key)."""
+        try:
+            term = " ".join(p for p in (artist, album or track) if p).strip()
+            if not term:
+                return None
+            r = requests.get(
+                "https://itunes.apple.com/search",
+                params={"term": term, "entity": "album", "limit": 5},
+                timeout=4,
+            )
+            r.raise_for_status()
+            results = (r.json() or {}).get("results") or []
+            album_l = (album or "").strip().lower()
+            artist_l = (artist or "").strip().lower()
+            best = None
+            for item in results:
+                art = item.get("artworkUrl100") or item.get("artworkUrl60")
+                if not art:
+                    continue
+                # Prefer matching album/artist when possible
+                coll = (item.get("collectionName") or "").lower()
+                art_name = (item.get("artistName") or "").lower()
+                score = 0
+                if album_l and album_l in coll:
+                    score += 2
+                if artist_l and artist_l in art_name:
+                    score += 2
+                if best is None or score > best[0]:
+                    best = (score, art)
+                if score >= 4:
+                    break
+            if not best:
+                return None
+            # Upscale common 100x100 artwork URL to 600x600
+            art = best[1].replace("100x100bb", "600x600bb").replace("60x60bb", "600x600bb")
+            return art
+        except Exception:
+            return None
+
+    def resolve_cover_for_discord(self, info):
+        """
+        Return a Discord-usable large_image value (https URL preferred).
+        LAN-only covers (Yamaha / private Navidrome) are skipped — Discord
+        cannot fetch them for other users — and we fall back to Last.fm / iTunes.
+        """
+        artist = (info.get("artist") or "").strip()
+        album = (info.get("album") or "").strip()
+        track = (info.get("track") or "").strip()
+        cache_key = f"{info.get('source')}|{artist}|{album}|{track}"
+
+        cached = self.cache.get_album_art(cache_key, "discord")
+        if cached:
+            return cached
+
+        candidates = []
+
+        # 1) Last.fm (public CDN)
+        lastfm = self.get_lastfm_art(artist, album)
+        if lastfm:
+            candidates.append(lastfm)
+
+        # 2) iTunes (public, no key)
+        itunes = self.get_itunes_art(artist, album, track)
+        if itunes:
+            candidates.append(itunes)
+
+        # 3) Source-provided URL only if publicly reachable
+        source_cover = info.get("cover_url")
+        if source_cover and is_public_http_host(source_cover):
+            candidates.append(source_cover)
+
+        for raw in candidates:
+            safe = discord_safe_image_url(raw)
+            if safe and safe.startswith("https://"):
+                self.cache.set_album_art(cache_key, "discord", safe)
+                return safe
+
+        # Last resort: uploaded Discord asset key (only works if registered
+        # under this application in the Developer Portal).
+        return GENERIC_IMAGE
 
     def run(self):
         self._set_status("Connecting to Discord...")
@@ -340,7 +485,7 @@ class YamahaRPCBridge(threading.Thread):
                 track_id = f"{info.get('source')}|{info['artist']}|{info['album']}|{info['track']}"
                 if track_id != self.last_track:
                     self.last_track = track_id
-                    album_art_url = self.get_album_art(info["artist"], info["album"])
+                    cover = self.resolve_cover_for_discord(info)
                     source_label = "Navidrome" if info.get("source") == "navidrome" else "Yamaha"
                     player = info.get("player") or ""
                     artist = info["artist"] or "Unknown artist"
@@ -360,7 +505,7 @@ class YamahaRPCBridge(threading.Thread):
                         "details": track,
                         "state": artist,
                         "assets": {
-                            "large_image": album_art_url if album_art_url else GENERIC_IMAGE,
+                            "large_image": cover,
                             "large_text": large_text,
                         },
                         "timestamps": {"start": start_ts},
@@ -389,12 +534,13 @@ class YamahaRPCBridge(threading.Thread):
                                 self.rpc.update(
                                     details=track,
                                     state=artist,
-                                    large_image=activity["assets"]["large_image"],
+                                    large_image=cover,
                                     large_text=large_text,
                                     start=start_ts,
                                 )
+                        cover_note = "cover" if cover.startswith("https://") else "no cover"
                         self._set_status(
-                            f'Listening to {artist} — {track} ({source_label})'
+                            f"Listening to {artist} — {track} ({source_label}, {cover_note})"
                         )
                     except Exception as e:
                         self._set_status(f"RPC update error: {e}")

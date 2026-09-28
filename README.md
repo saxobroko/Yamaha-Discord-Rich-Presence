@@ -9,7 +9,7 @@ optionally Navidrome (Subsonic API) now-playing.
 -   Shows as **Listening to (Artist)** (Spotify-style), not Playing
 -   Yamaha MusicCast and/or Navidrome (any of your devices)
 -   Source mode: `auto` (prefer Navidrome when actively playing, else Yamaha), `yamaha`, or `navidrome`
--   Shows Album Art if LastFM api is given (Falls back to your default picture)
+-   Shows album art via public HTTPS covers (Last.fm if keyed, else iTunes Search)
 -   Shows current timestamp
 
 Playback control is **not supported**, as the Yamaha API does not expose
