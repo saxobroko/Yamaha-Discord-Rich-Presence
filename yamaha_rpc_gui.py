@@ -26,7 +26,7 @@ import pystray
 from PIL import Image
 import sys
 
-APP_VERSION = "1.1.4"
+APP_VERSION = "1.1.5"
 # Discord activity.type: 0=Playing, 2=Listening, 3=Watching, 5=Competing
 ACTIVITY_LISTENING = 2
 # status_display_type: 0=app name, 1=state, 2=details → "Listening to {artist}"
@@ -491,16 +491,16 @@ class YamahaRPCBridge(threading.Thread):
                     artist = info["artist"] or "Unknown artist"
                     album = info["album"] or ""
                     track = info["track"] or "Unknown track"
-                    # Force Listening via raw SET_ACTIVITY so Discord shows
-                    # "Listening to {artist}" (not "Playing <app name>").
-                    large_text = f"via {source_label}"
+                    # "Listening to Playing music" means Discord is using the
+                    # Developer Portal app name. Override `name` with the artist
+                    # and keep status_display_type=STATE as a second path.
+                    large_text = album or f"via {source_label}"
                     if player:
                         large_text = f"{source_label}: {player}"
-                    elif album:
-                        large_text = album
                     start_ts = int(time.time()) - int(info.get("play_time", 0) or 0)
                     activity = {
                         "type": ACTIVITY_LISTENING,
+                        "name": artist,
                         "status_display_type": STATUS_DISPLAY_STATE,
                         "details": track,
                         "state": artist,
