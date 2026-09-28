@@ -12,6 +12,11 @@ a = Analysis(
     hiddenimports=[
         'pystray._win32',
         'PIL._tkinter_finder',
+        'pypresence',
+        'pypresence.payloads',
+        'pypresence.types',
+        'pypresence.presence',
+        'pypresence.baseclient',
     ],
     hookspath=[],
     hooksconfig={},

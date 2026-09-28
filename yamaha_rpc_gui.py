@@ -20,16 +20,17 @@ import time
 import hashlib
 import secrets
 from pypresence import Presence
-try:
-    from pypresence.types import ActivityType, StatusDisplayType
-except ImportError:  # pypresence < 4.6
-    ActivityType = None
-    StatusDisplayType = None
+from pypresence.payloads import Payload
 import os
 import pystray
 from PIL import Image
 import sys
 
+APP_VERSION = "1.1.3"
+# Discord activity.type: 0=Playing, 2=Listening, 3=Watching, 5=Competing
+ACTIVITY_LISTENING = 2
+# status_display_type: 0=app name, 1=state, 2=details → "Listening to {artist}"
+STATUS_DISPLAY_STATE = 1
 GENERIC_IMAGE = "3844724"
 SUBSONIC_API_VERSION = "1.16.1"
 SUBSONIC_CLIENT = "YamahaRPC"
@@ -344,31 +345,59 @@ class YamahaRPCBridge(threading.Thread):
                     player = info.get("player") or ""
                     artist = info["artist"] or "Unknown artist"
                     album = info["album"] or ""
-                    # Spotify-style: "Listening to {artist}" (needs pypresence 4.6+)
+                    track = info["track"] or "Unknown track"
+                    # Force Listening via raw SET_ACTIVITY so Discord shows
+                    # "Listening to {artist}" (not "Playing <app name>").
                     large_text = f"via {source_label}"
                     if player:
                         large_text = f"{source_label}: {player}"
                     elif album:
                         large_text = album
-                    kwargs = {
-                        "details": info["track"] or "Unknown track",
+                    start_ts = int(time.time()) - int(info.get("play_time", 0) or 0)
+                    activity = {
+                        "type": ACTIVITY_LISTENING,
+                        "status_display_type": STATUS_DISPLAY_STATE,
+                        "details": track,
                         "state": artist,
-                        "large_image": album_art_url if album_art_url else GENERIC_IMAGE,
-                        "large_text": large_text,
-                        "start": int(time.time()) - int(info.get("play_time", 0)),
+                        "assets": {
+                            "large_image": album_art_url if album_art_url else GENERIC_IMAGE,
+                            "large_text": large_text,
+                        },
+                        "timestamps": {"start": start_ts},
+                        "instance": True,
                     }
-                    if ActivityType is not None:
-                        kwargs["activity_type"] = ActivityType.LISTENING
-                    if StatusDisplayType is not None:
-                        kwargs["status_display_type"] = StatusDisplayType.STATE
                     try:
                         if self.rpc:
-                            self.rpc.update(**kwargs)
+                            # Prefer payload_override so type=2 is never dropped
+                            # by older pypresence wrappers / missing enums.
+                            try:
+                                self.rpc.update(
+                                    payload_override=Payload(
+                                        {
+                                            "cmd": "SET_ACTIVITY",
+                                            "args": {
+                                                "pid": os.getpid(),
+                                                "activity": activity,
+                                            },
+                                            "nonce": f"{time.time():.20f}",
+                                        },
+                                        clear_none=False,
+                                    )
+                                )
+                            except TypeError:
+                                # Very old pypresence without payload_override
+                                self.rpc.update(
+                                    details=track,
+                                    state=artist,
+                                    large_image=activity["assets"]["large_image"],
+                                    large_text=large_text,
+                                    start=start_ts,
+                                )
                         self._set_status(
-                            f'Listening: {artist} — {info["track"]} ({source_label})'
+                            f'Listening to {artist} — {track} ({source_label})'
                         )
-                    except:
-                        self._set_status("RPC update error")
+                    except Exception as e:
+                        self._set_status(f"RPC update error: {e}")
             else:
                 try:
                     if self.rpc:
@@ -389,7 +418,7 @@ class YamahaRPCBridge(threading.Thread):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Yamaha / Navidrome → Discord RPC")
+        self.title(f"Yamaha / Navidrome → Discord RPC v{APP_VERSION}")
         self.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         self._last_dpi = None
         self._dpi_check_after = None
