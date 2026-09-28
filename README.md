@@ -6,6 +6,7 @@ optionally Navidrome (Subsonic API) now-playing.
 ## Features
 
 -   Display current playing song on Discord RPC
+-   Shows as **Listening to (Artist)** (Spotify-style), not Playing
 -   Yamaha MusicCast and/or Navidrome (any of your devices)
 -   Source mode: `auto` (prefer Navidrome when actively playing, else Yamaha), `yamaha`, or `navidrome`
 -   Shows Album Art if LastFM api is given (Falls back to your default picture)
@@ -19,8 +20,8 @@ play/pause for most sources.
 ## Requirements
 
 -   Python 3.10+
+-   `pypresence` 4.6+ (for Listening activity type)
 -   A Yamaha AVR that supports the YXC API (RX-V6A, RX-A2A, etc.)
--   A Discord Bot Token
 -   Your Discord Application ID
 -   Your Yamaha device's IP address (optional if using Navidrome only)
 -   Navidrome base URL + username + password (optional if using Yamaha only)

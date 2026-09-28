@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - cursor/navidrome-now-playing-a5d5
+      - cursor/listening-presence-4cef
       - main
   pull_request:
     branches:

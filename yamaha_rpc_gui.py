@@ -20,6 +20,11 @@ import time
 import hashlib
 import secrets
 from pypresence import Presence
+try:
+    from pypresence.types import ActivityType, StatusDisplayType
+except ImportError:  # pypresence < 4.6
+    ActivityType = None
+    StatusDisplayType = None
 import os
 import pystray
 from PIL import Image
@@ -337,21 +342,30 @@ class YamahaRPCBridge(threading.Thread):
                     album_art_url = self.get_album_art(info["artist"], info["album"])
                     source_label = "Navidrome" if info.get("source") == "navidrome" else "Yamaha"
                     player = info.get("player") or ""
-                    large_text = f"Playing via {source_label}"
+                    artist = info["artist"] or "Unknown artist"
+                    album = info["album"] or ""
+                    # Spotify-style: "Listening to {artist}" (needs pypresence 4.6+)
+                    large_text = f"via {source_label}"
                     if player:
                         large_text = f"{source_label}: {player}"
+                    elif album:
+                        large_text = album
                     kwargs = {
-                        "details": info["track"],
-                        "state": f"{info['artist']} — {info['album']}",
+                        "details": info["track"] or "Unknown track",
+                        "state": artist,
                         "large_image": album_art_url if album_art_url else GENERIC_IMAGE,
                         "large_text": large_text,
-                        "start": int(time.time()) - int(info.get("play_time", 0))
+                        "start": int(time.time()) - int(info.get("play_time", 0)),
                     }
+                    if ActivityType is not None:
+                        kwargs["activity_type"] = ActivityType.LISTENING
+                    if StatusDisplayType is not None:
+                        kwargs["status_display_type"] = StatusDisplayType.STATE
                     try:
                         if self.rpc:
                             self.rpc.update(**kwargs)
                         self._set_status(
-                            f'{source_label}: {info["artist"]} — {info["track"]}'
+                            f'Listening: {artist} — {info["track"]} ({source_label})'
                         )
                     except:
                         self._set_status("RPC update error")
